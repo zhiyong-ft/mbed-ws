@@ -69,7 +69,12 @@ protected:
         if (r != NSAPI_ERROR_OK) {
             return r;
         }
-        return socket->connect(host, port);
+
+        SocketAddress sockAddr;
+        _network->gethostbyname(host, &sockAddr);
+        sockAddr.set_port(port);
+
+        return socket->connect(sockAddr);
     }
 };
 
