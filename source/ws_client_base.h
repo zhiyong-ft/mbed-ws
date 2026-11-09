@@ -49,6 +49,16 @@
 #define MBED_WS_USER_AGENT "Mbed-WS-Client"
 #endif
 
+// After connect() the socket is non-blocking. send() retries on NSAPI_ERROR_WOULD_BLOCK
+// and on partial writes, for at most this long, so a frame is never left half written
+#ifndef MBED_WS_SEND_TIMEOUT_MS
+#define MBED_WS_SEND_TIMEOUT_MS 5000
+#endif
+
+#ifndef MBED_WS_SEND_RETRY_INTERVAL_MS
+#define MBED_WS_SEND_RETRY_INTERVAL_MS 10
+#endif
+
 //#define MBED_WS_DEBUG 1
 
 // this library returns nsapi_error_t codes, plus these
@@ -131,6 +141,7 @@ public:
         _ping_failure_counter = 0;
         _ping_ev = 0;
         _ping_counter_reset_ev = 0;
+        reset_rx_parser();
     }
 
     /**
@@ -168,6 +179,7 @@ public:
         _ping_counter = 0;
         _pong_counter = 0;
         _ping_failure_counter = 0;
+        reset_rx_parser();
 
 #ifdef MBED_WS_HAS_MBED_HTTP
         if (!_network) {
@@ -292,7 +304,18 @@ public:
         return NSAPI_ERROR_OK;
     }
 
+    /**
+     * Send one frame. Thread safe: may be called from any thread, concurrently with the
+     * ping/pong frames sent by this class on the event queue thread.
+     */
     nsapi_error_t send(WS_OPCODE opcode, const uint8_t *data, size_t data_size) {
+        // _tx_buffer is shared, and header + payload of one frame must not interleave with another frame
+        ScopedLock<rtos::Mutex> lock(_tx_mutex);
+
+        if (!_socket) {
+            return NSAPI_ERROR_NO_SOCKET;
+        }
+
         bool use_tx_buffer = true;
         // if there's space in the ws_buffer, we'll put the payload there too
         // otherwise we'll need two TCP frames
@@ -308,12 +331,12 @@ public:
 
         nsapi_size_or_error_t r;
 
-        if (use_tx_buffer) {
+        if (use_tx_buffer && data_size > 0) {
             memcpy(_tx_buffer + idx, data, data_size);
             idx += data_size;
         }
 
-        r = _socket->send((const uint8_t*)_tx_buffer, idx);
+        r = send_all(_tx_buffer, idx);
 #ifdef MBED_WS_DEBUG
         printf("send1 returned %d\n", r);
 #endif
@@ -322,16 +345,14 @@ public:
             return r;
         }
 
-        if (!use_tx_buffer) {
-            r = _socket->send(data, data_size);
+        if (!use_tx_buffer && data_size > 0) {
+            r = send_all(data, data_size);
 #ifdef MBED_WS_DEBUG
             printf("send2 returned %d\n", r);
 #endif
         }
 
         return r < 0 ? r : NSAPI_ERROR_OK;
-
-        return 0;
     }
 
 #ifdef MBED_WS_HAS_MBED_HTTP
@@ -403,6 +424,57 @@ protected:
     virtual nsapi_error_t connect_socket(char *host, uint16_t port) = 0;
 
 private:
+    /**
+     * Write all bytes to the (non-blocking) socket.
+     * Retries on NSAPI_ERROR_WOULD_BLOCK and partial writes until MBED_WS_SEND_TIMEOUT_MS has passed.
+     * Must be called with _tx_mutex held.
+     * @return number of bytes sent (== len) or a negative error code
+     */
+    nsapi_size_or_error_t send_all(const uint8_t *buffer, size_t len) {
+        size_t sent = 0;
+        uint32_t waited_ms = 0;
+        while (sent < len) {
+            nsapi_size_or_error_t r = _socket->send(buffer + sent, len - sent);
+            if (r > 0) {
+                sent += r;
+                continue;
+            }
+            if (r == NSAPI_ERROR_WOULD_BLOCK || r == 0) {
+                if (waited_ms >= MBED_WS_SEND_TIMEOUT_MS) {
+                    return NSAPI_ERROR_TIMEOUT;
+                }
+                ThisThread::sleep_for(std::chrono::milliseconds(MBED_WS_SEND_RETRY_INTERVAL_MS));
+                waited_ms += MBED_WS_SEND_RETRY_INTERVAL_MS;
+                continue;
+            }
+            return r;
+        }
+        return (nsapi_size_or_error_t)sent;
+    }
+
+    void reset_rx_parser() {
+        memset(&_curr_msg, 0, sizeof(_curr_msg));
+        _curr_msg.state = WS_PARSING_NONE;
+    }
+
+    // Called once the full payload length is known
+    void rx_length_complete(rx_ws_message_t *msg) {
+        if (msg->is_masked) {
+            msg->state = WB_PARSING_MASK_1;
+        }
+        else {
+            rx_start_payload(msg);
+        }
+    }
+
+    // Called once length (and mask, if any) are parsed, next byte is the first payload byte
+    void rx_start_payload(rx_ws_message_t *msg) {
+        msg->payload_cur_pos = 0;
+        // Payloads larger than the buffer are discarded (payload == nullptr), never passed to rx_callback
+        msg->payload = (msg->payload_len <= MBED_WS_RX_PAYLOAD_BUFFER_SIZE) ? _rx_buffer : nullptr;
+        msg->state = (msg->payload_len == 0) ? WS_PARSING_DONE : WS_PARSING_PAYLOAD;
+    }
+
     int set_length(uint32_t len, uint8_t *buffer) {
         if (len < 126) {
             buffer[0] = len | (1 << 7);
@@ -482,19 +554,25 @@ private:
         }
     }
 
+    /**
+     * Feed one received byte into the frame parser.
+     * Parser state persists across recv() calls, so frames split over multiple TCP/TLS reads are handled.
+     * Every byte is consumed exactly once (no recursion re-feeding the same byte).
+     */
     WS_PARSING_STATE handle_rx_msg(rx_ws_message_t *msg, const uint8_t c) {
 #ifdef MBED_WS_DEBUG
-        printf("handle_rx_msg state=%d\n", msg->state);
+        printf("handle_rx_msg state=%d
+", msg->state);
 #endif
-
-        int i;
 
         switch (msg->state) {
             case WS_PARSING_NONE:
             case WS_PARSING_OPCODE:
+            case WS_PARSING_DONE:
                 memset(msg->mask, 0, 4);    // empty mask
                 msg->fin = c >> 7 & 0x1;    // first bit indicates the fin flag
                 msg->opcode = (WS_OPCODE)(c & 0b1111);   // last four bits indicate the opcode
+                msg->payload = nullptr;
                 msg->state = WS_PARSING_LEN;
                 break;
 
@@ -503,12 +581,11 @@ private:
                 msg->is_masked = c & 0x80;
                 msg->payload_cur_pos = 0;
 #ifdef MBED_WS_DEBUG
-                printf("WS_PARSING_LEN len=%lu\n", msg->payload_len);
+                printf("WS_PARSING_LEN len=%lu
+", msg->payload_len);
 #endif
-                if (msg->payload_len == 0) {
-                    msg->state = WS_PARSING_DONE;
-                }
-                else if (msg->payload_len == 126) {
+                if (msg->payload_len == 126) {
+                    msg->payload_len = 0;
                     msg->state = WS_PARSING_LEN126_1;
                 }
                 else if (msg->payload_len == 127) {
@@ -516,18 +593,18 @@ private:
                     msg->state = WS_PARSING_LEN127_1;
                 }
                 else {
-                    msg->state = WB_PARSING_MASK_CHECK;
+                    rx_length_complete(msg);
                 }
                 break;
 
             case WS_PARSING_LEN126_1:
-                msg->payload_len = c << 8;
+                msg->payload_len = (uint32_t)c << 8;
                 msg->state = WS_PARSING_LEN126_2;
                 break;
 
             case WS_PARSING_LEN126_2:
-                msg->payload_len += c;
-                msg->state = WB_PARSING_MASK_CHECK;
+                msg->payload_len |= c;
+                rx_length_complete(msg);
                 break;
 
             case WS_PARSING_LEN127_1:
@@ -538,19 +615,21 @@ private:
             case WS_PARSING_LEN127_6:
             case WS_PARSING_LEN127_7:
             case WS_PARSING_LEN127_8:
-                i = msg->state - WS_PARSING_LEN127_1;
-                msg->payload_len += (c << (7 - i) * 8);
-                msg->state = (WS_PARSING_STATE)((int)msg->state + 1);
-                break;
-
-            case WB_PARSING_MASK_CHECK:
-                if (!msg->is_masked) {
-                    msg->state = WS_PARSING_PAYLOAD_INIT;
+                // 64-bit big-endian length, only the low 32 bits are kept (payload_len is 32-bit)
+                // Anything that large exceeds the payload buffer and is discarded anyway
+                if (msg->state >= WS_PARSING_LEN127_5) {
+                    msg->payload_len = (msg->payload_len << 8) | c;
+                }
+                else if (c != 0) {
+                    msg->payload_len = UINT32_MAX;
+                }
+                if (msg->state == WS_PARSING_LEN127_8) {
+                    rx_length_complete(msg);
                 }
                 else {
-                    msg->state = WB_PARSING_MASK_1;
+                    msg->state = (WS_PARSING_STATE)((int)msg->state + 1);
                 }
-                return handle_rx_msg(msg, c);
+                break;
 
             case WB_PARSING_MASK_1:
                 msg->mask[0] = c;
@@ -569,84 +648,90 @@ private:
 
             case WB_PARSING_MASK_4:
                 msg->mask[3] = c;
-                msg->state = WS_PARSING_PAYLOAD_INIT;
+                rx_start_payload(msg);
                 break;
 
-            case WS_PARSING_PAYLOAD_INIT:
-                msg->payload_cur_pos = 0;
-                if (msg->payload_len <= MBED_WS_RX_PAYLOAD_BUFFER_SIZE) {
-                    msg->payload = _rx_buffer;
-                }
-                else {
-                    msg->payload = nullptr;
-                }
-                msg->state = WS_PARSING_PAYLOAD;
-                return handle_rx_msg(msg, c);
-
             case WS_PARSING_PAYLOAD:
-                if (msg->payload_len == 0) {
-                    msg->state = WS_PARSING_DONE;
-                    return handle_rx_msg(msg, c);
-                }
                 if (msg->payload != nullptr) {
                     msg->payload[msg->payload_cur_pos] = c ^ msg->mask[msg->payload_cur_pos % 4];
                 }
-                if (msg->payload_cur_pos + 1 == msg->payload_len) {
+                msg->payload_cur_pos++;
+                if (msg->payload_cur_pos >= msg->payload_len) {
                     msg->state = WS_PARSING_DONE;
                 }
-                msg->payload_cur_pos++;
                 break;
 
-            case WS_PARSING_DONE:
+            // No longer entered, kept in the enum for compatibility
+            case WB_PARSING_MASK_CHECK:
+            case WS_PARSING_PAYLOAD_INIT:
+                rx_start_payload(msg);
                 break;
         }
 
 #ifdef MBED_WS_DEBUG
-        printf("handle_rx_msg now state=%d\n", msg->state);
+        printf("handle_rx_msg now state=%d
+", msg->state);
 #endif
         return msg->state;
     }
 
-    void handle_socket_sigio() {
-        if (!_socket) return;
+    void handle_rx_frame_done() {
+#ifdef MBED_WS_DEBUG
+        printf("Websocket msg, opcode=%u, len=%lu, buffered=%c
+", _curr_msg.opcode, _curr_msg.payload_len, _curr_msg.payload ? 'Y' : 'N');
+#endif
+        if (_curr_msg.opcode == WS_PING_FRAME) {
+            // send pong back if server asks for it
+            _queue->call(callback(this, &WebsocketClientBase::send), WS_PONG_FRAME, nullptr, 0);
+        }
+        else if (_curr_msg.opcode == WS_PONG_FRAME) {
+            _pong_counter++;
+#ifdef MBED_WS_DEBUG
+            printf("Pong (%u)!
+", _pong_counter);
+#endif
+        }
+        else if (_curr_msg.opcode == WS_CONNECTION_CLOSE_FRAME) {
+            // Server is closing the connection
+            handle_disconnect();
+        }
+        else if (_curr_msg.payload == nullptr) {
+            // Payload larger than MBED_WS_RX_PAYLOAD_BUFFER_SIZE, it has been discarded
+#ifdef MBED_WS_DEBUG
+            printf("Websocket msg discarded, payload too large (%lu)
+", _curr_msg.payload_len);
+#endif
+        }
+        else if (_callbacks && _callbacks->rx_callback) {
+            _callbacks->rx_callback(_curr_msg.opcode, _curr_msg.payload, _curr_msg.payload_len);
+        }
+    }
 
+    void handle_socket_sigio() {
         uint8_t rx_buffer[MBED_WS_RX_BUFFER_SIZE];
 
-        nsapi_size_or_error_t r = _socket->recv(rx_buffer, sizeof(rx_buffer));
+        // Drain everything available: sigio is not guaranteed to fire again for data
+        // already buffered (e.g. decrypted TLS records larger than rx_buffer)
+        while (_socket) {
+            nsapi_size_or_error_t r = _socket->recv(rx_buffer, sizeof(rx_buffer));
 #ifdef MBED_WS_DEBUG
-        printf("socket.recv returned %d\n", r); // 0 would be fine, would block would be fine too
+            printf("socket.recv returned %d
+", r); // 0 would be fine, would block would be fine too
 #endif
-        if (r > 0) {
-            _curr_msg.state = WS_PARSING_NONE;
+            if (r <= 0) {
+                break;
+            }
 
             for (int ix = 0; ix < r; ix++) {
-                WS_PARSING_STATE s = handle_rx_msg(&_curr_msg, rx_buffer[ix]);
-                if (s == WS_PARSING_DONE) {
-#ifdef MBED_WS_DEBUG
-                    printf("Websocket msg, opcode=%u, len=%lu: ", _curr_msg.opcode, _curr_msg.payload_len);
-                    for (size_t jx = 0; jx < _curr_msg.payload_len; jx++) {
-                        printf("%c", _curr_msg.payload[jx]);
-                    }
-                    printf("\n");
-#endif
-                    _curr_msg.state = WS_PARSING_NONE;
-
-                    // send pong back if server asks for it
-                    if (_curr_msg.opcode == WS_PING_FRAME) {
-                        _queue->call(callback(this, &WebsocketClientBase::send), WS_PONG_FRAME, nullptr, 0);
-                    }
-                    else if (_curr_msg.opcode == WS_PONG_FRAME) {
-                        _pong_counter++;
-#ifdef MBED_WS_DEBUG
-                        printf("Pong (%u)!\n", _pong_counter);
-#endif
-                    }
-                    else if (_callbacks && _callbacks->rx_callback) {
-                        _callbacks->rx_callback(_curr_msg.opcode, _curr_msg.payload, _curr_msg.payload_len);
+                if (handle_rx_msg(&_curr_msg, rx_buffer[ix]) == WS_PARSING_DONE) {
+                    handle_rx_frame_done();
+                    // handle_disconnect() may have closed the socket, stop parsing stale data
+                    if (_curr_msg.opcode == WS_CONNECTION_CLOSE_FRAME) {
+                        reset_rx_parser();
+                        return;
                     }
                 }
             }
-
         }
     }
 
@@ -706,6 +791,9 @@ private:
     int _ping_counter_reset_ev;
 
     rx_ws_message_t _curr_msg;
+
+    // Serializes send() between application threads and ping/pong on the event queue thread
+    rtos::Mutex _tx_mutex;
 };
 
 #endif // _MBED_WS_WS_REQUEST_BASE_H_
